@@ -1,5 +1,5 @@
 # Data files - DO NOT commit to GitHub
-data/
+/data/
 *.csv
 *.jsonl
 *.json
