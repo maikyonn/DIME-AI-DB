@@ -82,7 +82,7 @@ def main():
     
     elif choice == "3":
         # Check if database exists
-        db_path = Path("snap_data_lancedb")
+        db_path = Path("influencers_lancedb")
         if not db_path.exists():
             print(f"❌ Database not found at {db_path}")
             print("Run option 1 or 2 first to create the database")

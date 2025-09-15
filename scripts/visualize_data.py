@@ -18,7 +18,7 @@ import numpy as np
 def load_data():
     """Load data from LanceDB table"""
     try:
-        db = lancedb.connect("snap_data_lancedb")
+        db = lancedb.connect("influencers_lancedb")
         table = db.open_table("influencer_profiles")
         df = table.to_pandas()
         return df
@@ -37,11 +37,12 @@ def create_score_distributions(df):
         return
     
     fig = make_subplots(
-        rows=1, cols=3,
+        rows=2, cols=2,
         subplot_titles=[
             'Individual vs Organization', 
             'Generational Appeal (Gen Z Fit)', 
-            'Professionalization Index'
+            'Professionalization Index',
+            'Relationship Status'
         ]
     )
     
@@ -63,12 +64,20 @@ def create_score_distributions(df):
     fig.add_trace(
         go.Histogram(x=llm_df['professionalization_score'], name='Professionalization',
                     marker_color='lightcoral', showlegend=False),
-        row=1, col=3
+        row=2, col=1
     )
+    
+    # Relationship Status Score
+    if 'relationship_status_score' in llm_df.columns:
+        fig.add_trace(
+            go.Histogram(x=llm_df['relationship_status_score'], name='Relationship Status',
+                        marker_color='lightyellow', showlegend=False),
+            row=2, col=2
+        )
     
     fig.update_layout(
         title_text="Distribution of LLM Analysis Scores",
-        height=400
+        height=600
     )
     
     fig.update_xaxes(title_text="Score (0-10)", range=[0, 10])
@@ -78,32 +87,143 @@ def create_score_distributions(df):
 
 
 def create_keyword_analysis(df):
-    """Create keyword frequency analysis"""
+    """Create comprehensive keyword frequency analysis"""
     llm_df = df[df['llm_processed'] == True].copy()
     
     if len(llm_df) == 0:
         return
     
-    # Collect all keywords
+    # Collect all keywords (now including keywords 6-10)
     all_keywords = []
-    for col in ['keyword1', 'keyword2', 'keyword3', 'keyword4', 'keyword5']:
-        keywords = llm_df[col].dropna().str.strip()
-        all_keywords.extend(keywords[keywords != ''].tolist())
+    keyword_cols = ['keyword1', 'keyword2', 'keyword3', 'keyword4', 'keyword5', 
+                   'keyword6', 'keyword7', 'keyword8', 'keyword9', 'keyword10']
+    
+    # Track keywords by position for analysis
+    keywords_by_position = {}
+    total_keywords_found = 0
+    
+    for col in keyword_cols:
+        if col in llm_df.columns:
+            keywords = llm_df[col].dropna().str.strip()
+            valid_keywords = keywords[keywords != ''].tolist()
+            all_keywords.extend(valid_keywords)
+            keywords_by_position[col] = valid_keywords
+            total_keywords_found += len(valid_keywords)
     
     # Count keywords
     keyword_counts = Counter(all_keywords)
-    top_keywords = dict(keyword_counts.most_common(20))
+    unique_keywords_count = len(keyword_counts)
     
-    if top_keywords:
-        fig = px.bar(
-            x=list(top_keywords.values()),
-            y=list(top_keywords.keys()),
-            orientation='h',
-            title="Top 20 Keywords from LLM Analysis",
-            labels={'x': 'Frequency', 'y': 'Keywords'}
-        )
-        fig.update_layout(height=500)
-        st.plotly_chart(fig, use_container_width=True)
+    # Display comprehensive statistics
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric("Total Keywords", f"{total_keywords_found:,}")
+    
+    with col2:
+        st.metric("Unique Keywords", f"{unique_keywords_count:,}")
+    
+    with col3:
+        avg_keywords_per_profile = total_keywords_found / len(llm_df) if len(llm_df) > 0 else 0
+        st.metric("Avg Keywords/Profile", f"{avg_keywords_per_profile:.1f}")
+    
+    with col4:
+        profiles_with_keywords = sum(1 for _, row in llm_df.iterrows() 
+                                   if any(row.get(col, '').strip() for col in keyword_cols if col in llm_df.columns))
+        keyword_coverage = (profiles_with_keywords / len(llm_df)) * 100 if len(llm_df) > 0 else 0
+        st.metric("Keyword Coverage", f"{keyword_coverage:.1f}%")
+    
+    # Create two columns for charts
+    chart_col1, chart_col2 = st.columns([2, 1])
+    
+    with chart_col1:
+        # Top keywords bar chart
+        if keyword_counts:
+            top_keywords = dict(keyword_counts.most_common(30))
+            fig = px.bar(
+                x=list(top_keywords.values()),
+                y=list(top_keywords.keys()),
+                orientation='h',
+                title="Top 30 Keywords from LLM Analysis",
+                labels={'x': 'Frequency', 'y': 'Keywords'},
+                color=list(top_keywords.values()),
+                color_continuous_scale='viridis'
+            )
+            fig.update_layout(height=800, showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
+    
+    with chart_col2:
+        # Keyword position distribution
+        if keywords_by_position:
+            position_counts = {}
+            for col, keywords in keywords_by_position.items():
+                position_num = col.replace('keyword', '')
+                position_counts[f"Pos {position_num}"] = len(keywords)
+            
+            fig_pos = px.bar(
+                x=list(position_counts.keys()),
+                y=list(position_counts.values()),
+                title="Keywords by Position",
+                labels={'x': 'Keyword Position', 'y': 'Count'},
+                color=list(position_counts.values()),
+                color_continuous_scale='plasma'
+            )
+            fig_pos.update_layout(height=400, showlegend=False)
+            st.plotly_chart(fig_pos, use_container_width=True)
+        
+        # Keyword length distribution
+        if all_keywords:
+            keyword_lengths = [len(keyword.split()) for keyword in all_keywords]
+            length_counts = Counter(keyword_lengths)
+            
+            fig_len = px.bar(
+                x=list(length_counts.keys()),
+                y=list(length_counts.values()),
+                title="Keywords by Word Count",
+                labels={'x': 'Words per Keyword', 'y': 'Count'},
+                color=list(length_counts.values()),
+                color_continuous_scale='cividis'
+            )
+            fig_len.update_layout(height=400, showlegend=False)
+            st.plotly_chart(fig_len, use_container_width=True)
+    
+    # Expandable section for complete keyword list
+    with st.expander(f"📋 Complete Keyword List ({unique_keywords_count:,} unique keywords)", expanded=False):
+        # Sort keywords alphabetically for better browsing
+        sorted_keywords = sorted(keyword_counts.items(), key=lambda x: x[0].lower())
+        
+        # Create searchable keyword list
+        search_term = st.text_input("🔍 Search keywords:", placeholder="Type to filter keywords...")
+        
+        if search_term:
+            filtered_keywords = [(k, v) for k, v in sorted_keywords if search_term.lower() in k.lower()]
+            st.write(f"Found {len(filtered_keywords)} keywords containing '{search_term}':")
+        else:
+            filtered_keywords = sorted_keywords
+            st.write("All keywords (sorted alphabetically):")
+        
+        # Display keywords in a more compact format
+        if filtered_keywords:
+            # Group keywords for better display
+            keywords_text = ""
+            for i, (keyword, count) in enumerate(filtered_keywords):
+                keywords_text += f"**{keyword}** ({count})  •  "
+                # Add line break every 5 keywords for readability
+                if (i + 1) % 5 == 0:
+                    keywords_text += "\n\n"
+            
+            st.markdown(keywords_text)
+            
+            # Download option for keyword list
+            if st.button("💾 Download Complete Keyword List"):
+                keyword_df = pd.DataFrame(filtered_keywords, columns=['Keyword', 'Frequency'])
+                csv = keyword_df.to_csv(index=False)
+                st.download_button(
+                    label="Download Keywords CSV",
+                    data=csv,
+                    file_name="instagram_keywords_analysis.csv",
+                    mime="text/csv"
+                )
 
 
 def create_follower_analysis(df):
@@ -334,11 +454,23 @@ def create_advanced_data_panel(df):
             else:
                 prof_score_range = (0, 10)
             
+            # Relationship Status range
+            if 'relationship_status_score' in df.columns:
+                rel_score_range = st.slider(
+                    "Relationship Status Score:",
+                    min_value=0,
+                    max_value=10,
+                    value=(0, 10),
+                    help="0=Single, 3-4=Dating, 6-7=Married, 8-10=Family account"
+                )
+            else:
+                rel_score_range = (0, 10)
+            
             # Keyword filter
             keyword_filter = st.text_input(
                 "Contains Keyword:", 
                 placeholder="e.g., fashion, food, tech",
-                help="Searches across all 5 LLM keywords"
+                help="Searches across all 10 LLM keywords"
             )
     
     # Apply filters
@@ -425,9 +557,18 @@ def create_advanced_data_panel(df):
         )
         filtered_df = filtered_df[score_mask]
     
+    if 'relationship_status_score' in filtered_df.columns:
+        score_mask = (
+            (filtered_df['relationship_status_score'].isna()) |
+            ((filtered_df['relationship_status_score'] >= rel_score_range[0]) & 
+             (filtered_df['relationship_status_score'] <= rel_score_range[1]))
+        )
+        filtered_df = filtered_df[score_mask]
+    
     # Keyword filter
     if keyword_filter:
-        keyword_cols = ['keyword1', 'keyword2', 'keyword3', 'keyword4', 'keyword5']
+        keyword_cols = ['keyword1', 'keyword2', 'keyword3', 'keyword4', 'keyword5',
+                       'keyword6', 'keyword7', 'keyword8', 'keyword9', 'keyword10']
         available_keyword_cols = [col for col in keyword_cols if col in filtered_df.columns]
         
         if available_keyword_cols:
@@ -450,8 +591,9 @@ def create_advanced_data_panel(df):
     # Categorize columns
     basic_cols = ['account', 'full_name', 'followers', 'following', 'avg_engagement', 'posts_count', 'biography']
     profile_cols = ['is_private', 'is_verified', 'is_business_account', 'category_name', 'external_url']
-    llm_cols = ['individual_vs_org_score', 'generational_appeal_score', 'professionalization_score', 
-               'keyword1', 'keyword2', 'keyword3', 'keyword4', 'keyword5', 'llm_processed']
+    llm_cols = ['individual_vs_org_score', 'generational_appeal_score', 'professionalization_score', 'relationship_status_score',
+               'keyword1', 'keyword2', 'keyword3', 'keyword4', 'keyword5', 
+               'keyword6', 'keyword7', 'keyword8', 'keyword9', 'keyword10', 'llm_processed']
     
     available_basic = [col for col in basic_cols if col in filtered_df.columns]
     available_profile = [col for col in profile_cols if col in filtered_df.columns]
@@ -540,7 +682,7 @@ def show_data_sample(df):
     
     # Show key columns for quick overview
     key_columns = ['account', 'full_name', 'followers', 'following', 'posts_count']
-    llm_columns = ['individual_vs_org_score', 'generational_appeal_score', 'keyword1', 'keyword2']
+    llm_columns = ['individual_vs_org_score', 'generational_appeal_score', 'relationship_status_score', 'keyword1', 'keyword2']
     
     available_key_cols = [col for col in key_columns if col in df.columns]
     available_llm_cols = [col for col in llm_columns if col in df.columns]

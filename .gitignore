@@ -8,8 +8,8 @@ sample_response.json
 # LanceDB databases
 *.lance/
 *_lancedb/
-snap_data_lancedb/
-snap_data_lancedb_backup_*/
+influencers_lancedb/
+influencers_lancedb_backup_*/
 
 # Python
 __pycache__/
