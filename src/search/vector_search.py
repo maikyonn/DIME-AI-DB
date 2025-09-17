@@ -9,6 +9,13 @@ from sentence_transformers import SentenceTransformer
 from typing import Dict, List, Optional, Tuple, Any
 import json
 from dataclasses import dataclass
+import re
+
+from src.search.query_expander import (
+    build_augmented_query,
+    expand_query_terms,
+    normalize_query,
+)
 
 
 @dataclass
@@ -42,6 +49,7 @@ class VectorSearchEngine:
         
         # Default search weights (balanced distribution)
         self.default_weights = SearchWeights(keyword=0.33, profile=0.33, content=0.34)
+        self.lexical_boost_weight = 0.06  # metadata boost when explicit matches occur
     
     def connect(self):
         """Connect to LanceDB and load model"""
@@ -84,15 +92,21 @@ class VectorSearchEngine:
         
         weights.normalize()
         print(f"⚖️ Search weights - Keyword: {weights.keyword:.2f}, Profile: {weights.profile:.2f}, Content: {weights.content:.2f}")
-        
-        # Generate query embedding
-        query_embedding = self.model.encode([query])[0].tolist()
+
+        normalized_query = normalize_query(query)
+        expanded_terms = expand_query_terms(query)
+        if expanded_terms:
+            print(f"🔍 Query expansions: {expanded_terms}")
+
+        augmented_query = build_augmented_query(query, expanded_terms)
+        # Generate query embedding on the expanded text; keeps original query for display
+        query_embedding = self.model.encode([augmented_query])[0].tolist()
         
         # Store filters for later application (after search)
         apply_filters_later = filters is not None
         
-        # Search each vector type
-        search_limit = min(limit * 5, 1000)  # Get more results for better combination
+        # Search each vector type; honor caller-provided limit so ranking considers full result window
+        search_limit = max(int(limit), 1)
         
         try:
             # Keyword vector search
@@ -122,6 +136,12 @@ class VectorSearchEngine:
         combined_results = self._combine_search_results(
             keyword_results, profile_results, content_results,
             weights, query
+        )
+
+        combined_results = self._boost_metadata_matches(
+            combined_results,
+            normalized_query,
+            expanded_terms
         )
         
         # Apply filters after combining results
@@ -247,6 +267,59 @@ class VectorSearchEngine:
                 combined_results.append(record_data)
         
         return pd.DataFrame(combined_results)
+
+    def _boost_metadata_matches(
+        self,
+        df: pd.DataFrame,
+        normalized_query: str,
+        expanded_terms: List[str]
+    ) -> pd.DataFrame:
+        """Add lexical boosts when metadata contains the raw or expanded query terms."""
+        if df is None or df.empty:
+            return df
+
+        candidate_terms = set(t for t in normalized_query.split() if len(t) > 1)
+        candidate_terms.update(term.lower() for term in expanded_terms)
+
+        # Split multi-word phrases into component tokens as well
+        for term in list(candidate_terms):
+            if " " in term:
+                candidate_terms.update(part for part in term.split() if len(part) > 1)
+
+        candidate_terms.discard("")
+        if not candidate_terms:
+            return df
+
+        # Compile regexes once to ensure word-boundary matching
+        regexes = [re.compile(rf"\\b{re.escape(term)}\\b", re.IGNORECASE) for term in candidate_terms]
+
+        df = df.copy()
+        lexical_boost = np.zeros(len(df), dtype=np.float32)
+
+        if 'biography' in df.columns:
+            series = df['biography'].fillna('').astype(str)
+            matches = series.apply(
+                lambda text: sum(1 for pattern in regexes if pattern.search(text))
+            )
+            lexical_boost += matches.to_numpy(dtype=np.float32)
+
+        # Keyword columns are short tokens, so direct equality works well
+        keyword_columns = [f'keyword{i}' for i in range(1, 11)]
+        candidate_tokens = {term for term in candidate_terms if len(term) > 1}
+        for col in keyword_columns:
+            if col in df.columns:
+                series = df[col].fillna('').astype(str).str.lower()
+                matches = series.isin(candidate_tokens)
+                lexical_boost += matches.astype(float).to_numpy(dtype=np.float32)
+
+        if lexical_boost.any():
+            df['lexical_boost'] = lexical_boost
+            df['combined_score'] += lexical_boost * self.lexical_boost_weight
+
+        df['normalized_query'] = normalized_query
+        df['query_expansions'] = ", ".join(expanded_terms)
+
+        return df
     
     def search_similar_profiles(self, 
                               account_name: str,

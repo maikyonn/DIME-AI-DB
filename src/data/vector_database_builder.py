@@ -65,31 +65,35 @@ class VectorDatabaseBuilder(UnifiedDataLoader):
         
         return " ".join(text_parts)
     
-    def build_content_text(self, row) -> str:
-        """Build content vector text from post captions"""
+    def extract_clean_captions(self, row, max_posts: int = 20) -> List[str]:
+        """Return cleaned captions for the first N posts (limit 512 chars each)"""
         posts_data = row.get('posts', '')
         if not posts_data or posts_data == '' or pd.isna(posts_data):
-            return ""
-        
+            return []
+
         try:
             posts = json.loads(posts_data) if isinstance(posts_data, str) else posts_data
             if not isinstance(posts, list):
-                return ""
-            
+                return []
+
             captions = []
-            for post in posts[:10]:  # Use top 10 posts
+            for post in posts[:max_posts]:
                 if isinstance(post, dict) and 'caption' in post:
                     caption = post.get('caption', '')
                     if caption and isinstance(caption, str):
-                        # Clean caption (remove excessive hashtags, keep core content)
                         clean_caption = self.clean_caption(caption)
                         if clean_caption:
                             captions.append(clean_caption)
-            
-            return " ".join(captions)
-            
+
+            return captions
+
         except (json.JSONDecodeError, TypeError, AttributeError):
-            return ""
+            return []
+
+    def build_content_text(self, row) -> str:
+        """Build concatenated caption text for debugging/display"""
+        captions = self.extract_clean_captions(row)
+        return " ".join(captions)
     
     def clean_caption(self, caption: str) -> str:
         """Clean post caption for better embedding quality"""
@@ -115,9 +119,9 @@ class VectorDatabaseBuilder(UnifiedDataLoader):
         clean_text = re.sub(r'[^\w\s#@\.\,\!\?\-\n]', ' ', clean_text)
         
         # Limit length (embeddings work better with reasonable length)
-        if len(clean_text) > 1000:
-            clean_text = clean_text[:1000] + "..."
-        
+        if len(clean_text) > 512:
+            clean_text = clean_text[:512]
+
         return clean_text.strip()
     
     def generate_embeddings(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -133,14 +137,26 @@ class VectorDatabaseBuilder(UnifiedDataLoader):
         keyword_texts = []
         profile_texts = []
         content_texts = []
+        content_caption_lists: List[List[str]] = []
+        caption_index_ranges: List[Tuple[int, int]] = []
+        flattened_captions: List[str] = []
         
         for idx, row in tqdm(df.iterrows(), total=len(df), desc="Building natural text"):
             keyword_texts.append(self.build_keyword_text(row))
             profile_texts.append(self.build_profile_text(row))
-            content_texts.append(self.build_content_text(row))
+
+            captions = self.extract_clean_captions(row)
+            content_caption_lists.append(captions)
+            content_texts.append(" ".join(captions))
+
+            start_idx = len(flattened_captions)
+            if captions:
+                flattened_captions.extend(captions)
+            end_idx = len(flattened_captions)
+            caption_index_ranges.append((start_idx, end_idx))
         
         # Generate embeddings in batches (increased batch size for efficiency)
-        batch_size = 128
+        batch_size = 64
         
         print("🔤 Generating keyword embeddings (LLM-extracted)...")
         keyword_embeddings = model.encode(
@@ -158,23 +174,33 @@ class VectorDatabaseBuilder(UnifiedDataLoader):
             convert_to_numpy=True
         )
         
-        print("📱 Generating content embeddings (post captions)...")
-        content_embeddings = model.encode(
-            content_texts, 
-            batch_size=batch_size, 
-            show_progress_bar=True,
-            convert_to_numpy=True
-        )
-        
+        print("📱 Generating per-post content embeddings (mean pooled)...")
+        vector_dim = model.get_sentence_embedding_dimension()
+        content_embeddings = np.zeros((len(df), vector_dim), dtype=np.float32)
+
+        if flattened_captions:
+            caption_embeddings = model.encode(
+                flattened_captions,
+                batch_size=batch_size,
+                show_progress_bar=True,
+                convert_to_numpy=True
+            )
+
+            for row_idx, (start, end) in enumerate(caption_index_ranges):
+                if end > start:
+                    pooled = caption_embeddings[start:end].mean(axis=0)
+                    content_embeddings[row_idx] = pooled
+
         # Add embeddings to dataframe
         df['keyword_vector'] = keyword_embeddings.tolist()
         df['profile_vector'] = profile_embeddings.tolist()
         df['content_vector'] = content_embeddings.tolist()
-        
+
         # Add text for debugging/analysis
         df['keyword_text'] = keyword_texts
         df['profile_text'] = profile_texts
         df['content_text_sample'] = [text[:200] + "..." if len(text) > 200 else text for text in content_texts]
+        df['content_caption_count'] = [len(captions) for captions in content_caption_lists]
         
         # Mark all as English (preprocessing already filtered)
         df['is_english'] = True

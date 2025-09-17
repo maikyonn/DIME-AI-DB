@@ -28,7 +28,7 @@ class BatchProcessor:
     
     def __init__(self, api_key: Optional[str] = None):
         self.client = OpenAI(api_key=api_key or os.getenv("OPENAI_API_KEY")) if api_key or os.getenv("OPENAI_API_KEY") else None
-        self.analysis_prompt_template = """Analyze the provided Instagram bio and recent post captions to assign four scores and generate 10 unique keywords as described below, relying on thorough reasoning from bio and content features before concluding with a single CSV row:
+        self.analysis_prompt_template = """Analyze the provided Instagram bio and recent post captions to assign four scores, determine demographics, and generate 10 unique keywords as described below, relying on thorough reasoning from bio and content features before concluding with a single CSV row:
 
 - "Individual vs. Organization" Score (0–10):  
   Consider use of pronouns, family mentions, first-person narrative, and company keywords ("LLC," "shop," "brand"). Examine frequency of self versus third-person language. A score of 0 indicates a clear individual account, 2 is an individual content creator, 10 is a company/studio.  
@@ -38,17 +38,26 @@ class BatchProcessor:
   Evaluate for presence of sponsorships, disclaimers ("AD:"), affiliate links, organized highlights, partner tags, or clear evidence the user works with brands.
 - "Relationship Status" Score (0–10):
   Determine the apparent relationship status based on bio mentions, partner tags, couple photos, wedding references, or family content. A score of 0 indicates clearly single, 3-4 indicates dating/in relationship, 6-7 indicates engaged/married, 8-10 indicates family/couples account with children or joint account management.
+- "Location" (City, State):
+  Infer the city and state where they live based on bio mentions, location tags, post content, and contextual clues. Use format "City, State" (e.g., "Los Angeles, CA"). If no location can be determined, use "Unknown".
+- "Ethnicity":
+  Determine the apparent ethnicity/racial background based on visual content descriptions, name, cultural references, and language use patterns. Use broad categories like "White", "Black", "Hispanic/Latino", "Asian", "Middle Eastern", "Mixed", etc. If unclear, use "Unknown".
+- "Age":
+  Estimate the apparent age based on life stage references, educational context, career mentions, family status, and content style. Provide a single number (e.g., "25"). If unclear, use "Unknown".
 - "Profile Keywords" (10 unique keywords):
   Extract 10 distinctive keywords that best characterize this profile's content, interests, industry, style, and personality. Focus on unique descriptors, not generic terms. Include content themes, professional areas, lifestyle elements, and distinctive characteristics.
 
 Reasoning Order:  
-First, reason and note feature evidence from the profile regarding each scoring dimension and identify distinctive keywords; afterwards, assign a single, final CSV line with the four scores and 10 keywords.
+First, reason and note feature evidence from the profile regarding each scoring dimension and demographic characteristics; afterwards, assign a single, final CSV line with the four scores, demographics, and 10 keywords.
 
 Persist until you have fully analyzed all required features and evidence before proceeding to generate the final CSV output. Always output exactly one CSV row—do not include explanations, text, or formatting beyond the CSV line.
 
 **Output format:**  
-- Only a single CSV row with values in this exact order: individual_vs_org,generational_appeal,professionalization,relationship_status,keyword1,keyword2,keyword3,keyword4,keyword5,keyword6,keyword7,keyword8,keyword9,keyword10
+- Only a single CSV row with values in this exact order: individual_vs_org,generational_appeal,professionalization,relationship_status,location,ethnicity,age,keyword1,keyword2,keyword3,keyword4,keyword5,keyword6,keyword7,keyword8,keyword9,keyword10
 - Keywords should be single words or short phrases (max 2 words each)
+- Location should be "City, State" format or "Unknown"
+- Ethnicity should be a single term or "Unknown"
+- Age should be a number or "Unknown"
 - No additional text, punctuation, or formatting beyond the CSV line
 
 Profile Data:
@@ -57,7 +66,7 @@ Full Name: {full_name}
 Biography: {biography}
 Recent Post Captions (First 10 Posts): {posts}
 
-_Reminder: Carefully analyze profile content in detail before assigning numeric scores and generating distinctive keywords in the required CSV output._"""
+_Reminder: Carefully analyze profile content in detail before assigning numeric scores, demographic inferences, and generating distinctive keywords in the required CSV output._"""
     
     def read_snap_data(self, csv_path: str) -> List[Dict[str, str]]:
         """Read all rows from CSV file and ensure lance_db_id uniqueness"""
@@ -292,15 +301,18 @@ _Reminder: Carefully analyze profile content in detail before assigning numeric 
                                         text_content = content_item.get('text', '')
                                         break
                     
-                    # Parse CSV scores and keywords (expecting 14 values: 4 scores + 10 keywords)
-                    if ',' in text_content and text_content.count(',') == 13:
+                    # Parse CSV scores and keywords (expecting 17 values: 4 scores + 3 demographics + 10 keywords)
+                    if ',' in text_content and text_content.count(',') == 16:
                         try:
                             values = text_content.strip().split(',')
                             individual_vs_org = float(values[0])
                             generational_appeal = float(values[1])
                             professionalization = float(values[2])
                             relationship_status = float(values[3])
-                            keywords = [keyword.strip() for keyword in values[4:14]]
+                            location = values[4].strip()
+                            ethnicity = values[5].strip()
+                            age = values[6].strip()
+                            keywords = [keyword.strip() for keyword in values[7:17]]
                             
                             processed_data.append({
                                 'lance_db_id': lance_db_id,
@@ -309,6 +321,9 @@ _Reminder: Carefully analyze profile content in detail before assigning numeric 
                                 'generational_appeal': generational_appeal,
                                 'professionalization': professionalization,
                                 'relationship_status': relationship_status,
+                                'location': location,
+                                'ethnicity': ethnicity,
+                                'age': age,
                                 'keyword1': keywords[0] if len(keywords) > 0 else '',
                                 'keyword2': keywords[1] if len(keywords) > 1 else '',
                                 'keyword3': keywords[2] if len(keywords) > 2 else '',
@@ -324,7 +339,7 @@ _Reminder: Carefully analyze profile content in detail before assigning numeric 
                         except ValueError:
                             print(f"⚠️ Invalid scores for {custom_id}: {text_content}")
                     else:
-                        print(f"⚠️ Invalid CSV format for {custom_id} (expected 14 values, got {text_content.count(',') + 1}): {text_content}")
+                        print(f"⚠️ Invalid CSV format for {custom_id} (expected 17 values, got {text_content.count(',') + 1}): {text_content}")
                 else:
                     error = result.get('error', 'Unknown error')
                     print(f"❌ Failed request for {custom_id}: {error}")
@@ -333,7 +348,8 @@ _Reminder: Carefully analyze profile content in detail before assigning numeric 
             if processed_data:
                 with open(output_csv, 'w', newline='', encoding='utf-8') as f:
                     fieldnames = ['lance_db_id', 'custom_id', 'individual_vs_org', 'generational_appeal', 
-                                'professionalization', 'relationship_status', 'keyword1', 'keyword2', 'keyword3', 'keyword4', 'keyword5', 
+                                'professionalization', 'relationship_status', 'location', 'ethnicity', 'age',
+                                'keyword1', 'keyword2', 'keyword3', 'keyword4', 'keyword5', 
                                 'keyword6', 'keyword7', 'keyword8', 'keyword9', 'keyword10', 'raw_response']
                     writer = csv.DictWriter(f, fieldnames=fieldnames)
                     writer.writeheader()
