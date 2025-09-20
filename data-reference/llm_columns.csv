@@ -1,0 +1,24 @@
+column_name,sample_value
+lance_db_id,instagram_insta100kemail1_csv_000001
+individual_vs_org,10
+generational_appeal,6
+professionalization,9
+relationship_status,0
+location,Unknown
+ethnicity,Unknown
+age,Unknown
+occupation,Lens brand founder
+keyword1,fisheye
+keyword2,lens
+keyword3,giveaway
+keyword4,APS-C
+keyword5,Z mount
+keyword6,E mount
+keyword7,street photography
+keyword8,architecture
+keyword9,Dolomites
+keyword10,creativity
+prompt_file,current_prompt.txt
+raw_response,"10,6,9,0,Unknown,Unknown,Unknown,Lens brand founder,fisheye,lens,giveaway,APS-C,Z mount,E mount,street photography,architecture,Dolomites,creativity"
+processing_error,
+source_batch,batch_001
