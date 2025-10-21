@@ -12,6 +12,7 @@ venv/
 
 data/
 artifacts/
+pipeline/
 *.parquet
 *.arrow
 *.ipynb_checkpoints/
