@@ -1,0 +1,25 @@
+# Core web framework
+flask>=2.0.0
+
+# Database and data processing
+lancedb>=0.21.0
+pandas>=1.5.0
+numpy<2
+pyarrow>=12.0.0
+tf-keras
+
+# AI/ML dependencies
+sentence-transformers>=2.2.0
+torch>=1.13.0
+
+# LLM services
+openai>=1.30.0
+python-dotenv>=1.0.0
+
+# HTTP and async
+requests>=2.31.0
+aiohttp>=3.8.0
+
+# Data visualization
+streamlit>=1.28.0
+plotly>=5.15.0

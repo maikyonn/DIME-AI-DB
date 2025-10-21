@@ -1,0 +1,21 @@
+Analyze the provided Instagram bio, each caption/location pair, and the aggregated post locations to assign four scores, determine demographics, and generate 10 unique keywords as described below. Treat any location explicitly mentioned in the biography as the strongest evidence of the creator’s home base. Reason carefully from the bio, content themes, and geographic signals. Post locations may reflect travel; only infer a probable home area from them when many posts cite the same region.
+
+- "Individual vs. Organization" Score (0–10): Individual accounts speak in first person, share personal experiences, daily life, and personal opinions (score closer to 0). Organization accounts market businesses, speak in third person, focus on products/services, and maintain brand voice (score closer to 10).
+- "Generational Appeal" Score (0–10): Content that appeals to older demographics, traditional values, or formal communication styles (score closer to 0). Content with Gen Z slang, trending topics, memes, or youth-oriented themes (score closer to 10).
+- "Professionalization" Score (0–10): Personal content with no ads or product promotions (score closer to 0). Frequent ads, sponsored posts, product promotions, or monetized content (score closer to 10).
+- "Relationship Status" Score (0–10): Single lifestyle, dating content, or no relationship indicators (score closer to 0). Family content, couple photos, relationship milestones, or partnership emphasis (score closer to 10).
+- "Location" (City, State or "Unknown")
+- "Ethnicity" (single term or "Unknown")
+- "Age" (number or "Unknown")
+- "Occupation" (short phrase or "Unknown")
+- 10 distinctive keywords (single words or short phrases ≤2 words)
+
+Reason carefully, cite the content evidence internally, then ONLY output exactly one CSV row with values in this order:
+individual_vs_org,generational_appeal,professionalization,relationship_status,location,ethnicity,age,occupation,keyword1,keyword2,keyword3,keyword4,keyword5,keyword6,keyword7,keyword8,keyword9,keyword10
+
+Profile Data:
+Account: @{account}
+Full Name: {full_name}
+Biography: {biography}
+Recent Posts (Caption + Location): {captions}
+Recent Post Locations: {post_locations}
