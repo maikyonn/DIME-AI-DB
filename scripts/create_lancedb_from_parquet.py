@@ -1,51 +1,49 @@
 #!/usr/bin/env python3
 """
-Create a LanceDB table from `normalized_profiles.parquet`.
+Create a LanceDB table from `normalized_profiles.parquet` via a staged pipeline.
 
-- Builds two text facets per profile (profile_text, posts_text) without using unreliable location.
-- Computes dense embeddings (default: google/embeddinggemma-300m via sentence-transformers; overridable).
-- Fits a global TF-IDF (1–2 grams, min_df=2, max_features configurable) on all row `text`, with optional cuML acceleration.
-- Stores per-row sparse TF-IDF as (indices, values) lists.
-- Emits two rows per profile when both texts are present:
-    vector_id = "<lance_db_id>::profile" | content_type="profile"
-    vector_id = "<lance_db_id>::posts"   | content_type="posts"
-- Creates/opens a LanceDB table and appends rows in batches.
-- Does NOT attempt to parse or store locations (as requested).
+Stages:
+  1. Load parquet into a Polars DataFrame.
+  2. Build normalized facet records (profile/posts) from each profile row.
+  3. Fit a TF-IDF vectorizer.
+  4. Persist the vectorizer artifact and add per-record sparse TF-IDF features.
+  5. Fetch embeddings from DeepInfra asynchronously (batch size 256, <=190 concurrent requests) using aiometer with retries.
+  6. Build an Arrow schema from the enriched records.
+  7. Write records into LanceDB.
 
-Usage (typical):
-  python scripts/create_lancedb_from_parquet.py \
-      --parquet data/normalized_profiles.parquet \
-      --db-uri data/lancedb \
-      --table influencer_facets \
-      --embed-model google/embeddinggemma-300m \
-      --batch-size 512 --recreate \
-      --save-vectorizer artifacts/tfidf_vectorizer.pkl
-
-Requirements:
-  pip install lancedb pyarrow pandas numpy scikit-learn sentence-transformers torch joblib ujson
+This script only uses DeepInfra for embeddings. Set `DEEPINFRA_API_KEY` or pass
+`--deepinfra-api-key`. The embedding batch size is fixed at 256 per API request.
 """
-import os
-import re
+import argparse
+import asyncio
+import functools
 import gc
 import json
-import math
-import argparse
 import logging
-from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+import math
+import os
+import re
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-import numpy as np
-import pandas as pd
-
-# IO & ML deps
-import pyarrow as pa
-import pyarrow.parquet as pq
-from sklearn.feature_extraction.text import TfidfVectorizer
+import aiometer
 import joblib
-
-# Vector backend
 import lancedb
+import numpy as np
+import pyarrow as pa
+import polars as pl
+from dotenv import load_dotenv
+from openai import (
+    APIConnectionError,
+    APIError,
+    APITimeoutError,
+    AsyncOpenAI,
+    RateLimitError,
+)
+from sklearn.feature_extraction.text import TfidfVectorizer
+from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt, wait_exponential_jitter
 
 try:
     from cuml.feature_extraction.text import TfidfVectorizer as CuMLTfidfVectorizer
@@ -58,28 +56,110 @@ except Exception:  # pragma: no cover - optional dependency guard
     cudf = None  # type: ignore
     _HAS_CUML = False
 
-try:
-    import torch
-    _HAS_TORCH = True
-except Exception:  # pragma: no cover - optional dependency guard
-    torch = None  # type: ignore
-    _HAS_TORCH = False
-
-# Embedding (we prefer sentence-transformers for simplicity & speed)
-try:
-    from sentence_transformers import SentenceTransformer
-    _HAS_ST = True
-except Exception:
-    SentenceTransformer = None
-    _HAS_ST = False
-
-# If you really want to use HF models directly, you can add a simple
-# AutoModel/AutoTokenizer mean-pooling encoder here as a fallback.
-# For now, we keep the script minimal and recommend a SentenceTransformers model.
-# e.g., --embed-model BAAI/bge-m3 or intfloat/multilingual-e5-large-instruct
-
 LOGGER = logging.getLogger("create_lancedb")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+
+EMBED_BATCH_SIZE = 256
+MAX_CONCURRENT_REQUESTS = 190
+MAX_RETRY_ATTEMPTS = 5
+
+# Load environment variables from .env if present (e.g., DEEPINFRA_API_KEY).
+load_dotenv()
+
+
+@dataclass(frozen=True)
+class PipelineConfig:
+    parquet_path: str
+    db_uri: str
+    table: str
+    recreate: bool
+    sample_rows: Optional[int]
+    text_trunc: int
+    posts_max: int
+    tfidf_max_features: int
+    tfidf_min_df: int
+    ngram_range: Tuple[int, int]
+    tfidf_backend: str
+    tfidf_workers: int
+    vectorizer_path: str
+    embed_model: str
+    embed_concurrency: int
+    deepinfra_api_key: str
+    deepinfra_endpoint: str
+
+
+class DeepInfraEmbedder:
+    """Async client for DeepInfra's OpenAI-compatible embedding endpoint."""
+
+    def __init__(
+        self,
+        model: str,
+        api_key: Optional[str],
+        endpoint: str,
+        concurrency: int,
+    ) -> None:
+        self.model = model
+        self.api_key = api_key or os.environ.get("DEEPINFRA_API_KEY")
+        if not self.api_key:
+            raise ValueError("DeepInfra API key is required; set DEEPINFRA_API_KEY or use --deepinfra-api-key")
+        self.endpoint = endpoint.rstrip("/")
+        self.concurrency = max(1, min(concurrency, MAX_CONCURRENT_REQUESTS))
+        self.client = AsyncOpenAI(api_key=self.api_key, base_url=self.endpoint)
+
+    async def embed(self, texts: Sequence[str]) -> List[np.ndarray]:
+        if not texts:
+            return []
+
+        batches: List[Tuple[int, List[str]]] = []
+        for start in range(0, len(texts), EMBED_BATCH_SIZE):
+            batch = [str(t) for t in texts[start:start + EMBED_BATCH_SIZE]]
+            batches.append((start, batch))
+
+        results: List[Optional[np.ndarray]] = [None] * len(texts)
+
+        async def run_batch(start: int, batch_texts: List[str]) -> None:
+            async for attempt in AsyncRetrying(
+                reraise=True,
+                stop=stop_after_attempt(MAX_RETRY_ATTEMPTS),
+                wait=wait_exponential_jitter(initial=1, max=10),
+                retry=retry_if_exception_type(
+                    (
+                        APIError,
+                        APITimeoutError,
+                        APIConnectionError,
+                        RateLimitError,
+                        RuntimeError,
+                    )
+                ),
+            ):
+                with attempt:
+                    response = await self.client.embeddings.create(
+                        model=self.model,
+                        input=batch_texts,
+                        encoding_format="float",
+                    )
+
+            items = response.data or []
+            if len(items) != len(batch_texts):
+                raise RuntimeError(
+                    f"Embedding count mismatch (expected {len(batch_texts)}, got {len(items)})"
+                )
+            for offset, item in enumerate(items):
+                embedding = item.embedding
+                if embedding is None:
+                    raise RuntimeError("Missing embedding in DeepInfra response")
+                results[start + offset] = np.asarray(embedding, dtype=np.float32)
+
+        max_concurrency = min(self.concurrency, len(batches)) if batches else 1
+        await aiometer.run_all(
+            [functools.partial(run_batch, start, batch) for start, batch in batches],
+            max_at_once=max_concurrency,
+        )
+
+        missing = [idx for idx, vector in enumerate(results) if vector is None]
+        if missing:
+            raise RuntimeError(f"Missing embeddings for indices: {missing[:5]} ...")
+        return [vector for vector in results if vector is not None]
 
 
 def booly(x: Any) -> Optional[bool]:
@@ -137,11 +217,11 @@ def normalize_field_value(value: Any) -> Any:
         return None
     if isinstance(value, (bool, np.bool_)):
         return bool(value)
-    if isinstance(value, (np.integer,)):
+    if isinstance(value, (np.integer, int)):
         return int(value)
-    if isinstance(value, (np.floating,)):
+    if isinstance(value, (np.floating, float)):
         return float(value)
-    if isinstance(value, (pd.Timestamp, datetime)):
+    if isinstance(value, (datetime,)):
         return value.isoformat()
     if isinstance(value, (list, tuple, dict)):
         try:
@@ -151,8 +231,7 @@ def normalize_field_value(value: Any) -> Any:
     return value
 
 
-def build_profile_text(row: pd.Series, text_trunc: int, include_keywords: bool=True) -> str:
-    # Avoid unreliable location entirely, per user instruction
+def build_profile_text(row: Dict[str, Any], text_trunc: int, include_keywords: bool = True) -> str:
     parts: List[str] = []
     parts.append(coalesce(row.get("display_name"), row.get("username")))
     occ = clean_text(row.get("occupation"))
@@ -214,7 +293,6 @@ def extract_posts_chunks(posts_field: Any, posts_max: int = 5, snippet_max_len: 
         try:
             parsed = json.loads(s)
         except Exception:
-            # Treat as free-form text when the JSON parse fails
             text = clean_text(s)
             if snippet_max_len is not None and snippet_max_len > 0:
                 text = text[:snippet_max_len]
@@ -236,8 +314,9 @@ def extract_posts_chunks(posts_field: Any, posts_max: int = 5, snippet_max_len: 
             text_part: Optional[str] = None
             if isinstance(item, dict):
                 text_part = item.get("caption") or item.get("text") or item.get("title")
-                if not text_part and isinstance(item.get("extra"), dict):
-                    text_part = item["extra"].get("caption")
+                extra = item.get("extra")
+                if not text_part and isinstance(extra, dict):
+                    text_part = extra.get("caption")
                 for key in ("hashtags", "post_hashtags", "tags"):
                     hashtags.extend(_normalize_hashtags(item.get(key)))
             else:
@@ -248,7 +327,7 @@ def extract_posts_chunks(posts_field: Any, posts_max: int = 5, snippet_max_len: 
     elif isinstance(parsed, dict):
         if "captions" in parsed and isinstance(parsed["captions"], list):
             for candidate in parsed["captions"][:posts_max]:
-                hashtags: List[str] = []
+                hashtags = []
                 text_part: Optional[str] = None
                 if isinstance(candidate, dict):
                     text_part = candidate.get("text") or candidate.get("caption")
@@ -271,9 +350,9 @@ def extract_posts_chunks(posts_field: Any, posts_max: int = 5, snippet_max_len: 
 
 
 def batched(iterable: Iterable[Any], n: int) -> Iterable[List[Any]]:
-    buf = []
-    for it in iterable:
-        buf.append(it)
+    buf: List[Any] = []
+    for item in iterable:
+        buf.append(item)
         if len(buf) >= n:
             yield buf
             buf = []
@@ -281,60 +360,59 @@ def batched(iterable: Iterable[Any], n: int) -> Iterable[List[Any]]:
         yield buf
 
 
-def load_dataframe(parquet_path: str, sample_rows: Optional[int] = None) -> pd.DataFrame:
-    df = pd.read_parquet(parquet_path)
-    if sample_rows and sample_rows > 0 and sample_rows < len(df):
-        df = df.sample(n=sample_rows, random_state=42)
-    df = df.reset_index(drop=True)
+def load_dataframe(parquet_path: str, sample_rows: Optional[int] = None) -> pl.DataFrame:
+    df = pl.read_parquet(parquet_path)
+    if sample_rows and sample_rows > 0 and sample_rows < df.height:
+        df = df.sample(n=sample_rows, shuffle=True, seed=42)
     return df
 
 
-def make_rows(df: pd.DataFrame, text_trunc: int, posts_max: int) -> List[Dict[str, Any]]:
+def make_rows(df: pl.DataFrame, text_trunc: int, posts_max: int) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
-    for _, r in df.iterrows():
-        lance_db_id = coalesce(r.get("lance_db_id"), r.get("platform_id"), r.get("username"))
-        # Build profile text
-        profile_text = build_profile_text(r, text_trunc=text_trunc)
-        posts_chunks = extract_posts_chunks(r.get("posts"), posts_max=posts_max) if "posts" in r else []
+    columns = df.columns
+    for row in df.iter_rows(named=True):
+        profile_text = build_profile_text(row, text_trunc=text_trunc)
+        posts_chunks = extract_posts_chunks(row.get("posts"), posts_max=posts_max) if "posts" in row else []
         posts_text = " \n ".join(posts_chunks)
 
-        row_values = {col: normalize_field_value(r.get(col)) for col in df.columns}
+        lance_db_id = coalesce(row.get("lance_db_id"), row.get("platform_id"), row.get("username"))
+        row_values = {col: normalize_field_value(row.get(col)) for col in columns}
 
         meta_common = dict(
             lance_db_id=lance_db_id,
-            platform=coalesce(r.get("platform")),
-            platform_id=coalesce(r.get("platform_id")),
-            username=coalesce(r.get("username")),
-            display_name=coalesce(r.get("display_name")),
-            biography=coalesce(r.get("biography")),
-            external_url=coalesce(r.get("external_url")),
-            profile_url=coalesce(r.get("profile_url")),
-            profile_image_url=coalesce(r.get("profile_image_url")),
-            followers=inty(r.get("followers")),
-            following=inty(r.get("following")),
-            likes_total=inty(r.get("likes_total")),
-            posts_count=inty(r.get("posts_count")),
-            engagement_rate=floaty(r.get("engagement_rate")),
-            median_view_count_last10=floaty(r.get("median_view_count_last10")),
-            median_like_count_last10=floaty(r.get("median_like_count_last10")),
-            median_comment_count_last10=floaty(r.get("median_comment_count_last10")),
-            reel_post_ratio_last10=floaty(r.get("reel_post_ratio_last10")),
-            total_img_posts_ig=inty(r.get("total_img_posts_ig")),
-            total_reels_ig=inty(r.get("total_reels_ig")),
-            individual_vs_org_score=floaty(r.get("individual_vs_org_score")),
-            generational_appeal_score=floaty(r.get("generational_appeal_score")),
-            professionalization_score=floaty(r.get("professionalization_score")),
-            relationship_status_score=floaty(r.get("relationship_status_score")),
-            occupation=coalesce(r.get("occupation")),
-            is_verified=booly(r.get("is_verified")),
-            is_private=booly(r.get("is_private")),
-            is_commerce_user=booly(r.get("is_commerce_user")),
-            source_batch=coalesce(r.get("source_batch")),
-            llm_processed=booly(r.get("llm_processed")),
-            source_csv=coalesce(r.get("source_csv")),
-            prompt_file=coalesce(r.get("prompt_file")),
-            raw_response=coalesce(r.get("raw_response")),
-            processing_error=coalesce(r.get("processing_error")),
+            platform=coalesce(row.get("platform")),
+            platform_id=coalesce(row.get("platform_id")),
+            username=coalesce(row.get("username")),
+            display_name=coalesce(row.get("display_name")),
+            biography=coalesce(row.get("biography")),
+            external_url=coalesce(row.get("external_url")),
+            profile_url=coalesce(row.get("profile_url")),
+            profile_image_url=coalesce(row.get("profile_image_url")),
+            followers=inty(row.get("followers")),
+            following=inty(row.get("following")),
+            likes_total=inty(row.get("likes_total")),
+            posts_count=inty(row.get("posts_count")),
+            engagement_rate=floaty(row.get("engagement_rate")),
+            median_view_count_last10=floaty(row.get("median_view_count_last10")),
+            median_like_count_last10=floaty(row.get("median_like_count_last10")),
+            median_comment_count_last10=floaty(row.get("median_comment_count_last10")),
+            reel_post_ratio_last10=floaty(row.get("reel_post_ratio_last10")),
+            total_img_posts_ig=inty(row.get("total_img_posts_ig")),
+            total_reels_ig=inty(row.get("total_reels_ig")),
+            individual_vs_org_score=floaty(row.get("individual_vs_org_score")),
+            generational_appeal_score=floaty(row.get("generational_appeal_score")),
+            professionalization_score=floaty(row.get("professionalization_score")),
+            relationship_status_score=floaty(row.get("relationship_status_score")),
+            occupation=coalesce(row.get("occupation")),
+            is_verified=booly(row.get("is_verified")),
+            is_private=booly(row.get("is_private")),
+            is_commerce_user=booly(row.get("is_commerce_user")),
+            source_batch=coalesce(row.get("source_batch")),
+            llm_processed=booly(row.get("llm_processed")),
+            source_csv=coalesce(row.get("source_csv")),
+            prompt_file=coalesce(row.get("prompt_file")),
+            raw_response=coalesce(row.get("raw_response")),
+            processing_error=coalesce(row.get("processing_error")),
         )
 
         for col, value in row_values.items():
@@ -342,20 +420,24 @@ def make_rows(df: pd.DataFrame, text_trunc: int, posts_max: int) -> List[Dict[st
                 meta_common[col] = value
 
         if profile_text:
-            rows.append({
-                "vector_id": f"{lance_db_id}::profile",
-                "content_type": "profile",
-                "text": profile_text,
-                **meta_common,
-            })
+            rows.append(
+                {
+                    "vector_id": f"{lance_db_id}::profile",
+                    "content_type": "profile",
+                    "text": profile_text,
+                    **meta_common,
+                }
+            )
         if posts_text:
-            rows.append({
-                "vector_id": f"{lance_db_id}::posts",
-                "content_type": "posts",
-                "text": posts_text,
-                **meta_common,
-                "_post_chunks": posts_chunks,
-            })
+            rows.append(
+                {
+                    "vector_id": f"{lance_db_id}::posts",
+                    "content_type": "posts",
+                    "text": posts_text,
+                    **meta_common,
+                    "_post_chunks": posts_chunks,
+                }
+            )
     return rows
 
 
@@ -368,7 +450,7 @@ def fit_tfidf(
 ):
     if backend == "cuml":
         if not _HAS_CUML:
-            raise RuntimeError("cuML is not available but --tfidf-backend=cuml was requested")
+            raise RuntimeError("cuML requested but unavailable")
         vec = CuMLTfidfVectorizer(
             max_features=max_features,
             min_df=min_df,
@@ -395,7 +477,6 @@ def add_sparse_fields(
     workers: int = 1,
     backend: str = "sklearn",
 ) -> None:
-    # Transform in batches to avoid memory spikes; optionally parallelize across threads.
     use_cuml = (
         backend == "cuml"
         and _HAS_CUML
@@ -403,7 +484,7 @@ def add_sparse_fields(
         and isinstance(vectorizer, CuMLTfidfVectorizer)
     )
     if use_cuml:
-        workers = 1  # GPU transform runs on-device; threading offers no benefit
+        workers = 1
 
     def ranges() -> Iterable[Tuple[int, int]]:
         for start in range(0, len(records), batch_size):
@@ -415,13 +496,12 @@ def add_sparse_fields(
         batch_texts = [records[i]["text"] for i in range(start, end)]
         if use_cuml:
             batch_series = cudf.Series(batch_texts, dtype="str")
-            X = vectorizer.transform(batch_series)  # returns GPU CSR
-            X = X.get()  # move to host as scipy CSR
+            X = vectorizer.transform(batch_series)
+            X = X.get()
         else:
             batch_texts = [str(t) for t in batch_texts]
-            X = vectorizer.transform(batch_texts)  # CSR
+            X = vectorizer.transform(batch_texts)
         if use_cuml:
-            # ensure garbage collected promptly on device
             cp.get_default_memory_pool().free_all_blocks()
         return start, end, X
 
@@ -445,82 +525,11 @@ def add_sparse_fields(
             del X
             gc.collect()
     finally:
-        if workers > 1 and 'executor' in locals():
+        if workers > 1 and "executor" in locals():
             executor.shutdown(wait=True)
 
 
-class STEmbedder:
-    def __init__(self, model_name: str, device: Optional[str] = None, normalize: bool = True):
-        if not _HAS_ST:
-            raise RuntimeError("sentence-transformers is not installed. pip install sentence-transformers")
-        resolved_device = device
-        if resolved_device is None and _HAS_TORCH and torch.cuda.is_available():  # pragma: no branch
-            resolved_device = "cuda"
-        token = (
-            os.environ.get("HF_TOKEN")
-            or os.environ.get("HUGGINGFACE_TOKEN")
-            or os.environ.get("HUGGINGFACE_HUB_TOKEN")
-            or os.environ.get("HUGGINGFACE_API_KEY")
-        )
-        st_kwargs = {"device": resolved_device or "cpu"}
-        if token:
-            # SentenceTransformer switched from use_auth_token -> token in newer releases; support both.
-            try:
-                st_kwargs["token"] = token
-                self.model = SentenceTransformer(model_name, **st_kwargs)
-            except TypeError:
-                st_kwargs.pop("token", None)
-                st_kwargs["use_auth_token"] = token
-                self.model = SentenceTransformer(model_name, **st_kwargs)
-        else:
-            self.model = SentenceTransformer(model_name, **st_kwargs)
-        self.device = resolved_device or "cpu"
-        self.normalize = normalize
-
-    def encode(self, texts: List[str], batch_size: int = 64) -> np.ndarray:
-        # Many ST models can normalize automatically; set normalize_embeddings=True for some models.
-        embs = self.model.encode(texts, batch_size=batch_size, show_progress_bar=True, normalize_embeddings=self.normalize)
-        if isinstance(embs, list):
-            embs = np.array(embs, dtype=np.float32)
-        if embs.dtype != np.float32:
-            embs = embs.astype(np.float32)
-        return embs
-
-
-def append_embeddings(records: List[Dict[str, Any]], embedder: STEmbedder, batch_size: int) -> None:
-    for batch_idx, batch in enumerate(batched(records, batch_size)):
-        flat_texts: List[str] = []
-        spans: List[Tuple[int, int]] = []
-
-        for record in batch:
-            chunks = record.get("_post_chunks")
-            if chunks:
-                start = len(flat_texts)
-                flat_texts.extend(chunks)
-                spans.append((start, len(chunks)))
-            else:
-                start = len(flat_texts)
-                flat_texts.append(record["text"])
-                spans.append((start, 1))
-
-        embs = embedder.encode(flat_texts, batch_size=batch_size)
-
-        for record, (start, length) in zip(batch, spans):
-            if length == 1 and not record.get("_post_chunks"):
-                vec = embs[start]
-            else:
-                chunk_vecs = embs[start:start + length]
-                vec = chunk_vecs.mean(axis=0)
-                norm = np.linalg.norm(vec)
-                if embedder.normalize and norm > 0:
-                    vec = vec / norm
-            record["embedding"] = vec.astype(np.float32).tolist()
-            if "_post_chunks" in record:
-                del record["_post_chunks"]
-
-
 def infer_arrow_type(value) -> pa.DataType:
-    # Helper for schema inference where we want stable types
     if value is None:
         return pa.null()
     if isinstance(value, bool):
@@ -532,7 +541,6 @@ def infer_arrow_type(value) -> pa.DataType:
     if isinstance(value, list):
         if not value:
             return pa.list_(pa.float32())
-        # assume list of floats or ints
         if all(isinstance(x, (float, np.floating)) for x in value):
             return pa.list_(pa.float32())
         if all(isinstance(x, (int, np.integer)) for x in value):
@@ -576,20 +584,184 @@ def build_schema_from_records(records: List[Dict[str, Any]]) -> pa.Schema:
     return pa.schema(fields)
 
 
-def main():
+def _resolve_tfidf_backend(requested: str) -> str:
+    if requested == "auto":
+        return "cuml" if _HAS_CUML else "sklearn"
+    if requested == "cuml" and not _HAS_CUML:
+        LOGGER.warning("cuML TF-IDF requested but unavailable; falling back to sklearn")
+        return "sklearn"
+    return requested
+
+
+def stage_load_dataframe(config: PipelineConfig) -> pl.DataFrame:
+    LOGGER.info("Stage 1: loading parquet -> Polars DataFrame (%s)", config.parquet_path)
+    df = load_dataframe(config.parquet_path, config.sample_rows)
+    LOGGER.info("Loaded %d profile rows", df.height)
+    return df
+
+
+def stage_build_records(config: PipelineConfig, df: pl.DataFrame) -> List[Dict[str, Any]]:
+    LOGGER.info("Stage 2: assembling facet records")
+    records = make_rows(df, text_trunc=config.text_trunc, posts_max=config.posts_max)
+    LOGGER.info("Prepared %d records", len(records))
+    if not records:
+        raise RuntimeError("No non-empty texts found. Nothing to write.")
+    return records
+
+
+def stage_fit_tfidf(config: PipelineConfig, records: List[Dict[str, Any]]):
+    backend = _resolve_tfidf_backend(config.tfidf_backend)
+    LOGGER.info(
+        "Stage 3: fitting TF-IDF (backend=%s, max_features=%d, min_df=%d, ngram=%d-%d)",
+        backend,
+        config.tfidf_max_features,
+        config.tfidf_min_df,
+        config.ngram_range[0],
+        config.ngram_range[1],
+    )
+    vectorizer = fit_tfidf(
+        [r["text"] for r in records],
+        max_features=config.tfidf_max_features,
+        min_df=config.tfidf_min_df,
+        ngram_range=config.ngram_range,
+        backend=backend,
+    )
+    return vectorizer, backend
+
+
+def stage_save_vectorizer(config: PipelineConfig, vectorizer) -> None:
+    path = config.vectorizer_path
+    if not path:
+        return
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    try:
+        joblib.dump(vectorizer, path)
+        LOGGER.info("Stage 4: saved TF-IDF vectorizer to %s", path)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("Unable to persist TF-IDF vectorizer: %s", exc)
+
+
+def stage_add_sparse_fields(
+    config: PipelineConfig,
+    records: List[Dict[str, Any]],
+    vectorizer,
+    backend: str,
+) -> None:
+    LOGGER.info("Stage 5: adding sparse TF-IDF fields (workers=%d)", config.tfidf_workers)
+    add_sparse_fields(records, vectorizer, workers=config.tfidf_workers, backend=backend)
+    gc.collect()
+
+
+def _normalize_vector(vec: np.ndarray) -> np.ndarray:
+    norm = float(np.linalg.norm(vec))
+    if norm == 0.0:
+        return vec
+    return vec / norm
+
+
+async def stage_embed_records_async(
+    config: PipelineConfig,
+    records: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    LOGGER.info(
+        "Stage 6: requesting embeddings from DeepInfra (batch_size=%d, concurrency<=%d)",
+        EMBED_BATCH_SIZE,
+        config.embed_concurrency,
+    )
+    embedder = DeepInfraEmbedder(
+        model=config.embed_model,
+        api_key=config.deepinfra_api_key,
+        endpoint=config.deepinfra_endpoint,
+        concurrency=config.embed_concurrency,
+    )
+
+    flat_texts: List[str] = []
+    spans: List[Tuple[int, int]] = []
+    for record in records:
+        chunks = record.get("_post_chunks")
+        if chunks:
+            start = len(flat_texts)
+            flat_texts.extend(chunks)
+            spans.append((start, len(chunks)))
+        else:
+            start = len(flat_texts)
+            flat_texts.append(record["text"])
+            spans.append((start, 1))
+
+    LOGGER.info("Embedding %d text fragments across %d records", len(flat_texts), len(records))
+    embeddings = await embedder.embed(flat_texts)
+
+    enriched: List[Dict[str, Any]] = []
+    for record, (start, length) in zip(records, spans):
+        enriched_record = dict(record)
+        chunk_vecs = embeddings[start:start + length]
+        if length == 1 and not record.get("_post_chunks"):
+            vec = chunk_vecs[0]
+        else:
+            vec = np.vstack(chunk_vecs).mean(axis=0)
+        vec = _normalize_vector(vec.astype(np.float32))
+        enriched_record["embedding"] = vec.tolist()
+        if "_post_chunks" in enriched_record:
+            del enriched_record["_post_chunks"]
+        enriched.append(enriched_record)
+    return enriched
+
+
+def stage_build_schema(records: List[Dict[str, Any]]) -> pa.Schema:
+    LOGGER.info("Stage 7: building Arrow schema")
+    schema = build_schema_from_records(records)
+    return schema
+
+
+def stage_write_lancedb(
+    config: PipelineConfig,
+    records: List[Dict[str, Any]],
+    schema: pa.Schema,
+) -> None:
+    LOGGER.info("Stage 8: writing records to LanceDB (%s/%s)", config.db_uri, config.table)
+    db = lancedb.connect(config.db_uri)
+
+    if config.recreate:
+        try:
+            tbl = db.open_table(config.table)
+            tbl.delete("")
+            LOGGER.info("Cleared existing table %s", config.table)
+        except Exception:
+            LOGGER.info("Table %s does not exist, creating fresh", config.table)
+
+    try:
+        tbl = db.create_table(config.table, schema=schema, mode="overwrite")
+        LOGGER.info("Created table %s", config.table)
+    except Exception:
+        tbl = db.open_table(config.table)
+        LOGGER.info("Opened existing table %s", config.table)
+
+    batch_size = 10_000
+    total = 0
+    for chunk in batched(records, batch_size):
+        tbl.add(chunk)
+        total += len(chunk)
+        LOGGER.info("Inserted %d rows (running total=%d)", len(chunk), total)
+    LOGGER.info("Completed LanceDB load (%d total rows)", total)
+
+
+def run_pipeline(config: PipelineConfig) -> None:
+    df = stage_load_dataframe(config)
+    records = stage_build_records(config, df)
+    vectorizer, backend = stage_fit_tfidf(config, records)
+    stage_save_vectorizer(config, vectorizer)
+    stage_add_sparse_fields(config, records, vectorizer, backend)
+    records = asyncio.run(stage_embed_records_async(config, records))
+    schema = stage_build_schema(records)
+    stage_write_lancedb(config, records, schema)
+
+
+def parse_args() -> PipelineConfig:
     ap = argparse.ArgumentParser()
     ap.add_argument("--parquet", type=str, default="normalized_profiles.parquet")
     ap.add_argument("--db-uri", type=str, default="data/lancedb")
     ap.add_argument("--table", type=str, default="influencer_facets")
     ap.add_argument("--recreate", action="store_true", help="Drop and recreate the table")
-    ap.add_argument("--embed-model", type=str, default=os.environ.get("EMBED_MODEL", "google/embeddinggemma-300m"))
-    ap.add_argument(
-        "--device",
-        type=str,
-        default=os.environ.get("EMBED_DEVICE"),
-        help="Force embedding device (e.g. cuda, cpu)",
-    )
-    ap.add_argument("--batch-size", type=int, default=512)
     ap.add_argument("--sample-rows", type=int, default=None)
     ap.add_argument("--text-trunc", type=int, default=2000)
     ap.add_argument("--posts-max", type=int, default=5)
@@ -612,82 +784,64 @@ def main():
         help=f"Worker threads for TF-IDF transform (default: {default_workers})",
     )
     ap.add_argument("--save-vectorizer", type=str, default="artifacts/tfidf_vectorizer.pkl")
+    ap.add_argument("--embed-model", type=str, default=os.environ.get("EMBED_MODEL", "google/embeddinggemma-300m"))
+    ap.add_argument(
+        "--embed-concurrency",
+        type=int,
+        default=MAX_CONCURRENT_REQUESTS,
+        help="Maximum concurrent DeepInfra embedding requests (capped at 190)",
+    )
+    ap.add_argument(
+        "--deepinfra-api-key",
+        type=str,
+        default=None,
+        help="DeepInfra API key (falls back to DEEPINFRA_API_KEY env)",
+    )
+    ap.add_argument(
+        "--deepinfra-endpoint",
+        type=str,
+        default=os.environ.get("DEEPINFRA_ENDPOINT", "https://api.deepinfra.com/v1/openai"),
+        help="DeepInfra endpoint base URL",
+    )
     args = ap.parse_args()
 
-    LOGGER.info("Loading parquet: %s", args.parquet)
-    df = load_dataframe(args.parquet, args.sample_rows)
-    LOGGER.info("Loaded %d profile rows", len(df))
+    api_key = args.deepinfra_api_key or os.environ.get("DEEPINFRA_API_KEY", "")
+    if not api_key:
+        raise SystemExit("DeepInfra API key required. Set DEEPINFRA_API_KEY or pass --deepinfra-api-key.")
 
-    LOGGER.info("Assembling facet texts (profile/posts) without location...")
-    records = make_rows(df, text_trunc=args.text_trunc, posts_max=args.posts_max)
-    LOGGER.info("Emittable facet records: %d", len(records))
-    if not records:
-        LOGGER.error("No non-empty texts found. Nothing to write.")
-        return
+    concurrency = min(args.embed_concurrency, MAX_CONCURRENT_REQUESTS)
+    if args.embed_concurrency > MAX_CONCURRENT_REQUESTS:
+        LOGGER.warning(
+            "embed_concurrency capped at %d (requested %d)",
+            MAX_CONCURRENT_REQUESTS,
+            args.embed_concurrency,
+        )
 
-    tfidf_backend = args.tfidf_backend
-    if tfidf_backend == "auto":
-        tfidf_backend = "cuml" if _HAS_CUML else "sklearn"
-    elif tfidf_backend == "cuml" and not _HAS_CUML:
-        LOGGER.warning("cuML TF-IDF requested but unavailable; falling back to sklearn")
-        tfidf_backend = "sklearn"
-
-    LOGGER.info("Fitting TF-IDF on %d texts (max_features=%d, min_df=%d, ngram=%d-%d, backend=%s)",
-                len(records), args.tfidf_max_features, args.tfidf_min_df, args.ngram_min, args.ngram_max, tfidf_backend)
-    vectorizer = fit_tfidf(
-        [r["text"] for r in records],
-        max_features=args.tfidf_max_features,
-        min_df=args.tfidf_min_df,
+    config = PipelineConfig(
+        parquet_path=args.parquet,
+        db_uri=args.db_uri,
+        table=args.table,
+        recreate=args.recreate,
+        sample_rows=args.sample_rows,
+        text_trunc=args.text_trunc,
+        posts_max=args.posts_max,
+        tfidf_max_features=args.tfidf_max_features,
+        tfidf_min_df=args.tfidf_min_df,
         ngram_range=(args.ngram_min, args.ngram_max),
-        backend=tfidf_backend,
+        tfidf_backend=args.tfidf_backend,
+        tfidf_workers=args.tfidf_workers,
+        vectorizer_path=args.save_vectorizer,
+        embed_model=args.embed_model,
+        embed_concurrency=concurrency,
+        deepinfra_api_key=api_key,
+        deepinfra_endpoint=args.deepinfra_endpoint,
     )
-    os.makedirs(os.path.dirname(args.save_vectorizer) or ".", exist_ok=True)
-    try:
-        joblib.dump(vectorizer, args.save_vectorizer)
-        LOGGER.info("Saved TF-IDF vectorizer to %s", args.save_vectorizer)
-    except Exception as exc:  # noqa: BLE001
-        LOGGER.warning("Unable to persist TF-IDF vectorizer (backend=%s): %s", tfidf_backend, exc)
+    return config
 
-    LOGGER.info("Transforming TF-IDF to sparse (indices/values) fields...")
-    add_sparse_fields(records, vectorizer, workers=args.tfidf_workers, backend=tfidf_backend)
 
-    LOGGER.info("Loading embedding model: %s", args.embed_model)
-    embedder = STEmbedder(args.embed_model, device=args.device, normalize=True)
-    LOGGER.info("Embedding device: %s", embedder.device)
-
-    LOGGER.info("Encoding dense embeddings in batches of %d...", args.batch_size)
-    append_embeddings(records, embedder, batch_size=args.batch_size)
-
-    # Prepare LanceDB
-    LOGGER.info("Connecting LanceDB: %s", args.db_uri)
-    db = lancedb.connect(args.db_uri)
-
-    schema = build_schema_from_records(records)
-
-    if args.recreate:
-        try:
-            tbl = db.open_table(args.table)
-            LOGGER.info("Dropping existing table: %s", args.table)
-            tbl.delete("")  # delete all rows
-            # lancedb doesn't expose explicit drop_table universally; overwrite on create instead.
-        except Exception:
-            pass
-
-    # Create or open table
-    try:
-        tbl = db.create_table(args.table, schema=schema, mode="overwrite")
-        LOGGER.info("Created table %s", args.table)
-    except Exception:
-        tbl = db.open_table(args.table)
-        LOGGER.info("Opened existing table %s", args.table)
-
-    # Append in chunks
-    batch = 10_000
-    for chunk in batched(records, batch):
-        tbl.add(chunk)
-        LOGGER.info("Added %d rows (total so far unknown; LanceDB append ok)", len(chunk))
-
-    LOGGER.info("Done. Table: %s", args.table)
+def main() -> None:
+    config = parse_args()
+    run_pipeline(config)
 
 
 if __name__ == "__main__":
